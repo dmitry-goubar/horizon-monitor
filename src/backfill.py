@@ -26,13 +26,13 @@ Entry points:
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .models import MessageEvent
+from .scroller import AdaptiveScroller, lines_sorted, pick_scroll_target
 
 # --------------------------------------------------------------------------- #
 # OCR frame parsing — pure functions, unit-testable offline against saved OCR. #
@@ -56,8 +56,6 @@ _SEP = re.compile(
 _SEP_MONTH_YEAR = re.compile(r"^(%s)\s+(\d{4})$" % "|".join(list(_MONTHS)[1:]), re.I)
 _SEP_FULL_DATE = re.compile(
     r"^[A-Za-z]+day,\s+([A-Za-z]+)\s+\d{1,2},\s+(\d{4})$", re.I)
-# "Last, First" — start of a header line; a safe (text) surface to wheel over.
-_NAME = re.compile(r"^[A-Z][\w'’.\-]+,\s*[A-Z]")
 
 # UI chrome / hovercard / reaction noise that OCR sweeps up between real bubbles.
 _ARTIFACTS = [
@@ -73,21 +71,6 @@ def _clean(msg: str) -> str:
     for rx in _ARTIFACTS:
         msg = rx.sub(" ", msg)
     return _WS.sub(" ", msg).strip()
-
-
-def _as_dict(ocr: Any) -> dict:
-    if isinstance(ocr, str):
-        try:
-            return json.loads(ocr)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return ocr or {}
-
-
-def lines_sorted(ocr: Any) -> list[dict]:
-    """OCR line boxes in reading order (top->bottom, then left->right)."""
-    lines = _as_dict(ocr).get("lines", [])
-    return sorted(lines, key=lambda l: (l.get("y", 0), l.get("x", 0)))
 
 
 def frame_rows(ocr: Any) -> list[str]:
@@ -195,31 +178,6 @@ def months_ago_ym(months: int, now: datetime | None = None) -> tuple[int, int]:
     return y, m
 
 
-def pick_scroll_target(lines: list[dict], pane: tuple[int, int, int, int],
-                       fallback: tuple[int, int]) -> tuple[int, int]:
-    """A point over real chat TEXT (a sender header) to put the wheel on.
-
-    Scrolling over an embedded image/table or dead space does nothing (the wheel
-    is eaten), so aim at a sender-name line — present in almost every frame and
-    always scrollable. Fall back to the given point if nothing text-like shows.
-    """
-    px, py, pw, ph = pane
-    cy = py + ph // 2
-
-    def safe(l: dict) -> bool:
-        t = l.get("text", "").strip()
-        x, w = l.get("x", 0), l.get("width", 0)
-        return (bool(_NAME.match(t)) or
-                (x < px + 320 and w < 340 and re.search(r"[A-Za-z]", t)
-                 and not re.search(r"\d{4,}", t)))
-
-    cands = [l for l in lines if safe(l)]
-    if not cands:
-        return fallback
-    best = min(cands, key=lambda l: abs(l.get("y", 0) - cy))
-    return best.get("x", px) + min(best.get("width", 40), 140) // 2, best.get("y", cy)
-
-
 # --------------------------------------------------------------------------- #
 # Live backfiller — drives the remote via HorizonMCPClient.                    #
 # --------------------------------------------------------------------------- #
@@ -254,8 +212,14 @@ class ChatBackfiller:
         self._focus_target = ctl.get("focus_target", "PVDI")
         self._screen = int(bf.get("screen", ctl.get("screen", 0)))
         self._pane = tuple(bf.get("pane", [690, 115, 1210, 800]))
-        self._scroll_amount = int(bf.get("scroll_amount", 25))
-        self._settle_ms = int(bf.get("settle_ms", 750))
+        # Adaptive scroller knobs (see src/scroller.py). scroll_amount is the wheel
+        # notches per *pulse*; the scroller decides how many pulses to fire per frame
+        # to hit target_fraction of the pane, so no frame re-captures 85% of the last.
+        self._base_amount = int(bf.get("scroll_amount", 15))
+        self._target_fraction = float(bf.get("target_fraction", 0.8))
+        self._max_pulses = int(bf.get("max_pulses", 16))
+        self._pulse_wait_ms = int(bf.get("pulse_wait_ms", 90))
+        self._settle_ms = int(bf.get("settle_ms", 650))
         self._stall_wait_ms = int(bf.get("stall_wait_ms", 2600))
         self._stall_limit = int(bf.get("stall_limit", 8))
         self._max_frames = int(bf.get("max_frames", 700))
@@ -298,18 +262,26 @@ class ChatBackfiller:
             await client.wait(150)
         await client.wait(self._settle_ms)
 
-        # 3) page upward, OCR + parse each frame
+        # 3) page upward with the ADAPTIVE scroller: it measures how far the content
+        #    actually moved each step and tunes the burst to ~target_fraction of the
+        #    pane, so frames barely overlap instead of re-capturing 85% every time.
+        scroller = AdaptiveScroller(
+            self._pane, screen,
+            base_amount=self._base_amount, target_fraction=self._target_fraction,
+            max_pulses=self._max_pulses, pulse_wait_ms=self._pulse_wait_ms,
+            settle_ms=self._settle_ms, on_log=self._log,
+        )
+        ocr, lines = await scroller.prime(client)
+
         result = BackfillResult()
         all_events: list[MessageEvent] = []
-        prev_full: str | None = None
         stall = 0
         for i in range(max_frames):
             if should_stop and should_stop():
                 result.stopped = "cancelled"
                 break
-            ocr = await client.ocr(x=px, y=py, width=pw, height=ph, screen=screen)
-            lines = lines_sorted(ocr)
-            full_sig = "\n".join(l.get("text", "") for l in lines)
+
+            # --- process the current frame ---
             frame_events = parse_frame(ocr, channel=chat_title, user_tokens=tokens)
             all_events.extend(frame_events)
             result.frames += 1
@@ -317,34 +289,28 @@ class ChatBackfiller:
                 m = _HEADER.match(l.get("text", "").strip())
                 if m:
                     result.times_seen.append(m.group("time").strip())
-            self._log(f"frame {i:04d}: {len(lines)} lines, +{len(frame_events)} blocks")
-
-            ym = hit_cutoff(lines, cutoff_ym)
-            if ym:
+            if hit_cutoff(lines, cutoff_ym):
+                ym = hit_cutoff(lines, cutoff_ym)
                 result.stopped = f"cutoff ({ym[0]}-{ym[1]:02d})"
                 break
 
-            if full_sig == prev_full:
+            # --- adaptively scroll to older content ---
+            ocr, lines, disp = await scroller.advance(client, "up")
+            moved = "??" if disp is None else abs(disp)
+            self._log(f"frame {i:04d}: +{len(frame_events)} blocks | {scroller.last_pulses} "
+                      f"pulses → moved {moved}px ({int(scroller.new_ratio(disp) * 100)}% new)")
+
+            # --- barely moved despite scrolling → top or Teams lazy-loading older msgs
+            if disp is not None and abs(disp) < scroller.stall_px:
                 stall += 1
-                # Usually Teams fetching older messages, not the real top: wait and
-                # hit the top edge hard to trigger the lazy-load before giving up.
                 await client.wait(self._stall_wait_ms)
-                tx, _ = pick_scroll_target(lines, self._pane, fallback)
-                await client.move_mouse(tx, py + 60, screen=screen)
-                await client.scroll(tx, py + 60, "up", amount=60, screen=screen)
+                ocr, lines, _ = await scroller.nudge_hard(client, "up")
                 await client.wait(self._stall_wait_ms)
                 if stall >= self._stall_limit:
                     result.stopped = "top"
                     break
-                prev_full = full_sig
-                continue
-            stall = 0
-            prev_full = full_sig
-
-            tx, ty = pick_scroll_target(lines, self._pane, fallback)
-            await client.move_mouse(tx, ty, screen=screen)
-            await client.scroll(tx, ty, "up", amount=self._scroll_amount, screen=screen)
-            await client.wait(self._settle_ms)
+            else:
+                stall = 0
         else:
             result.stopped = "max_frames"
 

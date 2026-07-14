@@ -122,14 +122,21 @@ focus_target  = "PVDI"             # local Horizon window to focus before sendin
 # newest->oldest and OCRs each frame — FREE, offline, NO Claude API — then ingests
 # into the same SQLite + ChromaDB stores.  `python main.py backfill "ResiDB Support"`.
 # Drives the remote (scrolls), so it needs [control].enabled = true.
-screen        = 0                  # VDI monitor the chat is on (list_monitors index)
-pane          = [690, 115, 1210, 800]  # message-pane rect on that screen: x, y, w, h
-scroll_amount = 25                 # wheel notches per step (small => frames overlap, no skips)
-settle_ms     = 750                # wait after each scroll for render + lazy-load
-stall_wait_ms = 2600               # extra wait on a stall so Teams can fetch older messages
-stall_limit   = 8                  # identical frames in a row before we call it the top
-max_frames    = 700                # safety cap on total frames
-months        = 6                  # stop once messages older than this many months appear
+screen          = 0                # VDI monitor the chat is on (list_monitors index)
+pane            = [690, 115, 1210, 800]  # message-pane rect on that screen: x, y, w, h
+# Adaptive scroll (src/scroller.py): it MEASURES how far the pane actually moved each
+# step (by matching OCR text anchors between frames) and fires as many wheel "pulses"
+# as needed to advance ~target_fraction of the pane — so each frame is mostly NEW
+# content instead of re-capturing ~85% of the last one. Overshoots self-correct.
+scroll_amount   = 15               # wheel notches per pulse
+target_fraction = 0.8              # advance this share of the pane per frame (keeps ~0.2 overlap)
+max_pulses      = 16               # cap on pulses per frame (guards a bad gain estimate)
+pulse_wait_ms   = 90               # wait between pulses within one burst
+settle_ms       = 650              # wait after a burst for render + lazy-load
+stall_wait_ms   = 2600             # extra wait on a stall so Teams can fetch older messages
+stall_limit     = 8                # near-zero-move frames in a row before we call it the top
+max_frames      = 700              # safety cap on total frames
+months          = 6                # stop once messages older than this many months appear
 
 # [pricing]  — OPTIONAL. Overrides the Settings tab's cost estimate ($/1M tokens =
 # [input, output]). Built-in defaults match Anthropic's published rates as of 2026-06
