@@ -1854,3 +1854,162 @@ class RemotePage(QWidget):
             asyncio.run(go())
         except Exception as exc:  # noqa: BLE001
             self._sig.status.emit(f"Keep-awake stopped: {exc}")
+
+
+# ---------------------------------------------------------------- Backfill tab
+
+class _BackfillSignals(QObject):
+    """Marshal ChatBackfiller worker-thread progress onto the Qt UI thread."""
+    log = Signal(str)
+    status = Signal(str)
+    done = Signal(str)
+
+
+class BackfillPage(QWidget):
+    """Import a whole Teams chat's back-history into the knowledge base.
+
+    Unlike the live monitor (which sees only the current screen), this scrolls a
+    named conversation newest→oldest and OCRs each frame — free, offline, no Claude
+    API cost — then ingests into the same SQLite + ChromaDB stores. Wraps
+    src.backfill.ChatBackfiller on a worker thread with its own MCP connection
+    (mirrors the CLI `backfill`), gated behind [control].enabled since it scrolls
+    the remote.
+    """
+
+    def __init__(self, config: dict, api_key: str = "") -> None:
+        super().__init__()
+        self._config = config
+        self._control_enabled = bool(config.get("control", {}).get("enabled", False))
+        self._running = False
+        self._stop = threading.Event()
+
+        self._sig = _BackfillSignals()
+        self._sig.log.connect(self._append)
+        self._sig.status.connect(self._set_status)
+        self._sig.done.connect(self._on_done)
+
+        page, body = _page_scaffold(
+            "Backfill",
+            "Import a whole Teams chat's history into the knowledge base. It scrolls the "
+            "named chat newest→oldest and reads each frame with free offline OCR — no "
+            "Claude API cost. Bring the chat to the front in the remote first.",
+        )
+
+        if not self._control_enabled:
+            warn, _ = _card(
+                "Remote control is off",
+                "Backfill scrolls the remote session — set [control].enabled = true in "
+                "config.toml to enable it.",
+            )
+            body.addWidget(warn)
+
+        bf = config.get("backfill", {})
+        form, fl = _card(
+            "Backfill a chat",
+            "The chat title must match the name shown at the top of the conversation.",
+        )
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Chat title"))
+        self.chat = QLineEdit()
+        self.chat.setPlaceholderText("e.g. ResiDB Support")
+        row.addWidget(self.chat, 1)
+        row.addWidget(QLabel("Months back"))
+        self.months = QSpinBox()
+        self.months.setRange(1, 36)
+        self.months.setValue(int(bf.get("months", 6)))
+        row.addWidget(self.months)
+        fl.addLayout(row)
+
+        opt_row = QHBoxLayout()
+        self.ingest = QCheckBox("Ingest into the knowledge base")
+        self.ingest.setChecked(True)
+        self.ingest.setToolTip("Uncheck for a dry run — scroll and parse but store nothing.")
+        opt_row.addWidget(self.ingest)
+        opt_row.addStretch(1)
+        self.run_btn = QPushButton("Run backfill")
+        self.run_btn.setObjectName("Primary")
+        self.run_btn.clicked.connect(self._run)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._request_stop)
+        opt_row.addWidget(self.run_btn)
+        opt_row.addWidget(self.stop_btn)
+        fl.addLayout(opt_row)
+        body.addWidget(form)
+
+        self.status = QLabel("Ready." if self._control_enabled else "Disabled.")
+        self.status.setObjectName("Dim")
+        self.status.setWordWrap(True)
+        body.addWidget(self.status)
+
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setMinimumHeight(200)
+        body.addWidget(self.out, 1)
+
+        QVBoxLayout(self).addWidget(page)
+
+        if not self._control_enabled:
+            for w in (self.run_btn, self.chat, self.months, self.ingest):
+                w.setEnabled(False)
+
+    # -------------------------------------------------- ui-thread slots
+    def _append(self, text: str) -> None:
+        self.out.appendPlainText(text)
+        self.out.ensureCursorVisible()
+
+    def _set_status(self, text: str) -> None:
+        self.status.setText(text)
+
+    def _on_done(self, summary: str) -> None:
+        self._running = False
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.chat.setEnabled(True)
+        self._append(f"\n✔ {summary}")
+        self._set_status("Done.")
+
+    # -------------------------------------------------- actions
+    def _request_stop(self) -> None:
+        self._stop.set()
+        self._set_status("Stopping after the current frame…")
+
+    def _run(self) -> None:
+        if self._running or not self._control_enabled:
+            return
+        title = self.chat.text().strip()
+        if not title:
+            self._set_status("Enter the chat title first.")
+            return
+        months = self.months.value()
+        ingest = self.ingest.isChecked()
+        self._stop.clear()
+        self._running = True
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.out.clear()
+        self._set_status(f"Backfilling {title!r} — bring the chat to the front…")
+        threading.Thread(
+            target=self._worker, args=(title, months, ingest), daemon=True
+        ).start()
+
+    def _worker(self, title: str, months: int, ingest: bool) -> None:
+        async def go() -> None:
+            from src.mcp_client import HorizonMCPClient
+            from src.backfill import ChatBackfiller
+            cfg = self._config
+            async with HorizonMCPClient(
+                cfg["mcp"]["server_path"], cfg["mcp"]["command"]
+            ) as client:
+                bf = ChatBackfiller(cfg, on_log=self._sig.log.emit)
+                result = await bf.run(
+                    client, title, months=months, ingest=ingest,
+                    should_stop=self._stop.is_set,
+                )
+                self._sig.done.emit(result.summary())
+
+        try:
+            asyncio.run(go())
+        except BaseException as exc:  # noqa: BLE001 — unwrap TaskGroup groups too
+            self._sig.log.emit(f"ERROR: {_explain_exc(exc)}")
+            self._sig.done.emit("failed")

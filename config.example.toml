@@ -116,6 +116,21 @@ max_long_edge = 1568               # downscale screenshots to this long edge for
 effort        = "high"             # reasoning effort ("high" is best for computer use)
 focus_target  = "PVDI"             # local Horizon window to focus before sending input
 
+[backfill]
+# One-time/periodic import of a whole Teams chat's BACK-HISTORY into the knowledge
+# base (the live monitor only sees the current screen). It scrolls the named chat
+# newest->oldest and OCRs each frame — FREE, offline, NO Claude API — then ingests
+# into the same SQLite + ChromaDB stores.  `python main.py backfill "ResiDB Support"`.
+# Drives the remote (scrolls), so it needs [control].enabled = true.
+screen        = 0                  # VDI monitor the chat is on (list_monitors index)
+pane          = [690, 115, 1210, 800]  # message-pane rect on that screen: x, y, w, h
+scroll_amount = 25                 # wheel notches per step (small => frames overlap, no skips)
+settle_ms     = 750                # wait after each scroll for render + lazy-load
+stall_wait_ms = 2600               # extra wait on a stall so Teams can fetch older messages
+stall_limit   = 8                  # identical frames in a row before we call it the top
+max_frames    = 700                # safety cap on total frames
+months        = 6                  # stop once messages older than this many months appear
+
 # [pricing]  — OPTIONAL. Overrides the Settings tab's cost estimate ($/1M tokens =
 # [input, output]). Built-in defaults match Anthropic's published rates as of 2026-06
 # (Haiku 4.5 $1/$5, Sonnet 4.6 $3/$15, Opus 4.8 $5/$25); set these only if rates change.

@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
 from . import state
 from .engine import CaptureEngine
 from .pages import (
-    AskPage, AssistPage, CollectPage, MonitorPage, PullPage, PushPage, RemotePage,
-    SettingsPage,
+    AskPage, AssistPage, BackfillPage, CollectPage, MonitorPage, PullPage, PushPage,
+    RemotePage, SettingsPage,
 )
 from .theme import COLORS
 
@@ -44,6 +44,7 @@ class _WebcamSignals(QObject):
 _NAV = [
     ("Monitor", "🔔", "monitor"),
     ("Collect", "📚", "collect"),
+    ("Backfill", "📥", "backfill"),
     ("Pull code", "⬇", "pull"),
     ("Push code", "⬆", "push"),
     ("Assist", "🤝", "assist"),
@@ -184,6 +185,7 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._monitor_page)
         self._collect_page = CollectPage(self._config, self._api_key)
         self._stack.addWidget(self._collect_page)
+        self._stack.addWidget(BackfillPage(self._config, self._api_key))
         # Shared {remote_path: pulled_text} so Push can diff against what Pull fetched.
         self._pulled: dict[str, str] = {}
         self._stack.addWidget(PullPage(self._config, self._api_key, self._pulled))

@@ -427,6 +427,100 @@ def assist(goal: str, act: bool):
 
 
 @cli.command()
+@click.argument("chat_title")
+@click.option("--months", type=int, default=None,
+              help="Stop once messages older than this many months appear "
+                   "(default [backfill].months).")
+@click.option("--max-frames", type=int, default=None,
+              help="Safety cap on total frames (default [backfill].max_frames).")
+@click.option("--screen", type=int, default=None,
+              help="VDI monitor the chat is on (default [backfill].screen).")
+@click.option("--no-ingest", is_flag=True,
+              help="Parse only; don't write to SQLite/ChromaDB (dry check).")
+def backfill(chat_title: str, months: int | None, max_frames: int | None,
+             screen: int | None, no_ingest: bool):
+    """Import a whole Teams chat's back-history into the knowledge base.
+
+    Unlike `monitor` (which sees only the current screen), this scrolls the named
+    conversation newest->oldest, OCRs each frame (FREE — no Claude API), and
+    ingests the history into SQLite + ChromaDB. Bring the chat to the front first.
+
+    \b
+    python main.py backfill "ResiDB Support"
+    python main.py backfill "ResiDB Support" --months 3 --no-ingest
+    """
+    config = load_config()
+    ctl = config.get("control", {})
+    if not ctl.get("enabled", False):
+        raise click.ClickException(
+            "Backfill scrolls/drives the remote — set [control].enabled = true in config.toml"
+        )
+    asyncio.run(_run_backfill(config, chat_title, months, max_frames, screen, not no_ingest))
+
+
+async def _run_backfill(config: dict, chat_title: str, months: int | None,
+                        max_frames: int | None, screen: int | None, ingest: bool) -> None:
+    from src.mcp_client import HorizonMCPClient
+    from src.backfill import ChatBackfiller
+
+    mcp_cfg = config["mcp"]
+    async with HorizonMCPClient(mcp_cfg["server_path"], mcp_cfg["command"]) as client:
+        bf = ChatBackfiller(config, on_log=lambda s: print(s, flush=True))
+        print(f"backfill: {chat_title!r} (ingest={ingest}) — bring the chat to the front. "
+              "Ctrl+C to stop", flush=True)
+        result = await bf.run(
+            client, chat_title, months=months, max_frames=max_frames,
+            screen=screen, ingest=ingest,
+        )
+        print(f"backfill: {result.summary()}", flush=True)
+
+
+@cli.command()
+@click.argument("keyword")
+@click.option("--limit", type=int, default=30, help="Max matches to show.")
+@click.option("--channel", default="", help="Restrict to a channel (substring match).")
+@click.option("--emails", is_flag=True,
+              help="Also list every email address found in the matches.")
+def search(keyword: str, limit: int, channel: str, emails: bool):
+    """Exact keyword search over collected messages (FREE — no API, no LLM).
+
+    The literal-lookup complement to `query` (which is semantic + Sonnet). Good for
+    finding an exact string — an email address, a table name, "distro" — that vector
+    search would only approximate.
+
+    \b
+    python main.py search distro
+    python main.py search better.com --emails
+    python main.py search email --channel "ResiDB Support"
+    """
+    import re as _re
+    config = load_config()
+    from src.store import EventStore
+
+    store = EventStore(config["rag"].get("events_db", "./data/events.db"))
+    store.connect()
+    rows = store.search(keyword, limit=limit, channel=channel or None)
+    if not rows:
+        click.echo(f"No messages matching {keyword!r} (of {store.count()} stored).")
+    for r in rows:
+        when = r.get("chat_time") or (r.get("observed_at") or "")[:16]
+        ch = f" «{r['channel']}»" if r.get("channel") else ""
+        click.echo(f"[{when}]{ch} {r['speaker']}: {r['message'][:160]}")
+    if emails:
+        found: dict[str, tuple[str, str]] = {}
+        for r in rows:
+            for m in _re.findall(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", r["message"]
+            ):
+                found.setdefault(m, (r["speaker"], r.get("chat_time", "")))
+        if found:
+            click.echo("\nEmail addresses found:")
+            for addr, (sp, ct) in sorted(found.items()):
+                click.echo(f"  {addr}  ({sp}, {ct})")
+    store.close()
+
+
+@cli.command()
 @click.argument("question")
 def query(question: str):
     """Ask a question about recorded conversations."""

@@ -117,6 +117,22 @@ class EventStore:
         sql += " ORDER BY observed_at ASC"
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
+    def search(self, text: str, limit: int = 50, channel: str | None = None) -> list[dict]:
+        """Substring (LIKE) search over message + speaker — the free, exact-lookup
+        complement to RAG semantic search (src/rag.py). Great for finding a literal
+        string (an email address, a table name, "distro") that vector search would
+        only approximate. Newest first; optional channel filter."""
+        assert self._conn is not None, "call connect() first"
+        like = f"%{text.lower()}%"
+        sql = ("SELECT * FROM events WHERE (lower(message) LIKE ? OR lower(speaker) LIKE ?)")
+        params: list = [like, like]
+        if channel:
+            sql += " AND lower(channel) LIKE ?"
+            params.append(f"%{channel.lower()}%")
+        sql += " ORDER BY observed_at DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
     def expire_older_than(self, cutoff_iso: str) -> int:
         """Delete events captured before cutoff_iso (for N-day retention).
 
